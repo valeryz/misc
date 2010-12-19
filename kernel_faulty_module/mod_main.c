@@ -18,6 +18,8 @@
 #include <linux/proc_fs.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
+#include <linux/atomic.h>
+#include <linux/rwsem.h>
 
 #include "faulty.h"
 
@@ -52,11 +54,16 @@ module_param(debug_level, uint, S_IRUGO|S_IWUSR);
 #define DBG(...)
 #endif
 
+/*
+ * Neither reading nor writing to /proc enties doesn't seem to modify the list
+ * structure itself, just the value of .called, so let's just make it atomic,
+ * and voila, concurrency problems with reading/writing solved.
+ */
 struct faulty_func {
     struct list_head list;
     char *name;
     faulty_funct_t f;
-    unsigned int called;
+    atomic_t called;
 };
 
 struct faulty {
@@ -65,6 +72,7 @@ struct faulty {
 
     struct list_head functions;
     unsigned int functions_num;
+    struct rw_semaphore rw_sem;
 };
 
 static struct faulty faulty;
@@ -82,7 +90,7 @@ int faulty_register(const char *name, faulty_funct_t f)
     func->name = (char *)(func + 1);
     memcpy(func->name, name, name_len);
     func->f = f;
-    func->called = 0;
+    atomic_set(&func->called, 0);
 
     list_add_tail(&func->list, &faulty.functions);
     ++faulty.functions_num;
@@ -94,6 +102,8 @@ EXPORT_SYMBOL_GPL(faulty_register);
 void faulty_unregister(const char *name)
 {
     struct faulty_func *func;
+
+    down_write(&faulty.rw_sem);
     list_for_each_entry(func, &faulty.functions, list) {
         if (!strcmp(func->name, name)) {
             list_del(&func->list);
@@ -103,22 +113,28 @@ void faulty_unregister(const char *name)
             break;
         }
     }
+    up_write(&faulty.rw_sem);
 }
 EXPORT_SYMBOL_GPL(faulty_unregister);
 
 void faulty_unregister_all(void)
 {
     struct faulty_func *func, *n;
+
+    down_write(&faulty.rw_sem);
     list_for_each_entry_safe(func, n, &faulty.functions, list) {
         list_del(&func->list);
         --faulty.functions_num;
         kfree(func);
     }
+    up_write(&faulty.rw_sem);
 }
 EXPORT_SYMBOL_GPL(faulty_unregister_all);
 
 static void *proc_info_seq_start(struct seq_file *f, loff_t *pos)
 {
+    down_read(&faulty.rw_sem);
+
     if (*pos >= faulty.functions_num)
         return NULL;
 
@@ -138,14 +154,15 @@ static void *proc_info_seq_next(struct seq_file *f, void *v, loff_t *pos)
 
 static void proc_info_seq_stop(struct seq_file *f, void *v)
 {
-	/* Nothing to do */
+    up_read(&faulty.rw_sem);
 }
 
 static int proc_info_seq_show(struct seq_file *f, void *v)
 {
     struct faulty_func *func = (struct faulty_func *)v;
 
-    return seq_printf(f, "%s: %u\n", func->name, func->called);
+    return seq_printf(f, "%s: %u\n", func->name,
+		      (unsigned)atomic_read(&func->called));
 }
 
 static const struct seq_operations proc_info_seq_ops = {
@@ -169,8 +186,8 @@ static struct file_operations proc_info_operations = {
 
 
 /* Using method (1) described in fs/proc/generic.c to return data */
-static int proc_ctrl_read(char *page, char **start, off_t off,
-        int count, int *eof, void *data)
+static int __proc_ctrl_read(char *page, char **start, off_t off,
+	int count, int *eof, void *data)
 {
     struct faulty_func *func;
     int written = 0, n;
@@ -211,6 +228,16 @@ static int proc_ctrl_read(char *page, char **start, off_t off,
     return written;
 }
 
+static int proc_ctrl_read(char *page, char **start, off_t off,
+			  int count, int *eof, void *data)
+{
+    int ret;
+    down_read(&faulty.rw_sem);
+    ret = __proc_ctrl_read(page, start, off, count, eof, data);
+    up_read(&faulty.rw_sem);
+    return ret;
+}
+
 static int proc_ctrl_write(struct file *file, const char __user *buffer,
         unsigned long count, void *data)
 {
@@ -228,16 +255,22 @@ static int proc_ctrl_write(struct file *file, const char __user *buffer,
     }
     kbuf[count] = 0x0;
 
+    down_read(&faulty.rw_sem);
+    
     list_for_each_entry(func, &faulty.functions, list) {
         if (!strcmp(func->name, kbuf)) {
             DBG(2, KERN_DEBUG, "calling %s\n", func->name);
-            ++func->called;
+            atomic_inc(&func->called);
+            /* must release the lock before doing anything faulty, because the
+             * oops would prevent us from releasing the lock! */
+            up_read(&faulty.rw_sem);
             func->f();
 
-            break;
+            goto out;
         }
     }
 
+    up_read(&faulty.rw_sem);
   out:
     kfree(kbuf);
 
@@ -324,7 +357,7 @@ static int __init faulty_debugfs_init(struct faulty *faulty)
 static void __exit faulty_debugfs_deinit(struct faulty *faulty)
 {
     if (faulty->debugfs_dir)
-        debugfs_remove_recursive(faulty->debugfs_dir);
+	debugfs_remove_recursive(faulty->debugfs_dir);
 }
 
 /*
@@ -341,6 +374,8 @@ static int __init faulty_init(void)
     faulty_register("null dereference", faulty_null_dereference);
     faulty_register("div by zero", faulty_div_by_zero);
     faulty_register("printk storm", faulty_printk_storm);
+
+    init_rwsem(&faulty.rw_sem);
 
     faulty_debugfs_init(&faulty);
     faulty_proc_init(&faulty);
