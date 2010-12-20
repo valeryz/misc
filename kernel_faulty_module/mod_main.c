@@ -92,8 +92,12 @@ int faulty_register(const char *name, faulty_funct_t f)
     func->f = f;
     atomic_set(&func->called, 0);
 
+    down_write(&faulty.rw_sem);
+    
     list_add_tail(&func->list, &faulty.functions);
     ++faulty.functions_num;
+
+    up_write(&faulty.rw_sem);
 
     return 0;
 }
@@ -370,12 +374,12 @@ static int __init faulty_init(void)
 
     INIT_LIST_HEAD(&faulty.functions);
 
+    init_rwsem(&faulty.rw_sem);
+
     faulty_register("branch through zero", faulty_branch_through_zero);
     faulty_register("null dereference", faulty_null_dereference);
     faulty_register("div by zero", faulty_div_by_zero);
     faulty_register("printk storm", faulty_printk_storm);
-
-    init_rwsem(&faulty.rw_sem);
 
     faulty_debugfs_init(&faulty);
     faulty_proc_init(&faulty);
